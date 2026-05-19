@@ -1,0 +1,113 @@
+services:
+  redis-stack:
+    image: redis/redis-stack:latest
+    container_name: semantic-cache-redis
+    ports:
+      - "6379:6379"
+      - "8001:8001"
+    environment:
+      - REDIS_ARGS=--appendonly yes --save 60 1 --maxmemory 2gb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    networks:
+      - cache-network
+
+  semantic-proxy:
+    build: .
+    container_name: semantic-cache-proxy
+    ports:
+      - "8000:8000"
+      - "9090:9090"
+    environment:
+      - REDIS_URL=redis://redis-stack:6379
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - WORKERS=4
+      - ENVIRONMENT=production
+      - OLLAMA_EMBEDDING_MODEL=nomic-embed-text
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis-stack:
+        condition: service_healthy
+    networks:
+      - cache-network
+    restart: unless-stopped
+
+  # Production cluster deployment - FIXED (removed container_name)
+  semantic-proxy-cluster:
+    build: .
+    # No container_name here - Docker will generate names like semantic-proxy-cluster-1, semantic-proxy-cluster-2
+    ports:
+      - "8002-8003:8000"  # Map ports 8002 and 8003 to the two replicas
+    environment:
+      - REDIS_URL=redis://redis-stack:6379
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - WORKERS=2
+      - ENVIRONMENT=production
+      - OLLAMA_EMBEDDING_MODEL=nomic-embed-text
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      redis-stack:
+        condition: service_healthy
+    deploy:
+      mode: replicated
+      replicas: 2
+      resources:
+        limits:
+          memory: 1G
+          cpus: "2"
+      restart_policy:
+        condition: on-failure
+    networks:
+      - cache-network
+    # Remove restart: unless-stopped when using deploy (deploy handles restart)
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: cache-prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - cache-network
+    profiles:
+      - monitoring
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: cache-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - cache-network
+    profiles:
+      - monitoring
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  cache-network:
+    driver: bridge
