@@ -6,22 +6,23 @@ from datetime import datetime
 import numpy as np
 
 class MetricsCollector:
-    """Collect and expose performance metrics"""
+    """Keeps track of how the server is performing over time — things like cache hit rate,
+    how slow or fast responses are, and how many errors we're seeing"""
     
-    def __init__(self, window_size: int = 3600):  # 1 hour window
+    def __init__(self, window_size: int = 3600):  # keeps data for the last 1 hour
         self.window_size = window_size
-        self.latencies = deque(maxlen=10000)
-        self.cache_hits = 0
-        self.cache_misses = 0
-        self.errors = 0
-        self.l1_hits = 0
-        self.l2_hits = 0
-        self.request_timestamps = deque(maxlen=window_size)
-        self.cache_write_ops = 0
-        self.batch_writes = 0
+        self.latencies = deque(maxlen=10000)  # stores last 10k response times, older ones get dropped automatically
+        self.cache_hits = 0       # how many times we served a response from cache
+        self.cache_misses = 0     # how many times we had to actually call the model
+        self.errors = 0           # anything that went wrong
+        self.l1_hits = 0          # hits from the faster in-memory cache (level 1)
+        self.l2_hits = 0          # hits from Redis (level 2, slightly slower but bigger)
+        self.request_timestamps = deque(maxlen=window_size)  # used to calculate requests/sec
+        self.cache_write_ops = 0  # how many times we wrote a new entry to cache
+        self.batch_writes = 0     # writes that were grouped together for efficiency
         
     def record_request(self, cached: bool, latency_ms: float, similarity: float = None):
-        """Record a request with its latency and cache status"""
+        """Called after every request — saves how long it took and whether cache helped or not"""
         self.latencies.append(latency_ms)
         self.request_timestamps.append(time.time())
         
@@ -31,7 +32,8 @@ class MetricsCollector:
             self.cache_misses += 1
     
     def record_cache_hit(self, level: str, latency_ms: float = 0, similarity: float = 1.0):
-        """Record cache hit with level (L1 or L2)"""
+        """Logs a cache hit and also tracks *which* cache level served it (L1 or L2)
+        — helps us know if the faster cache is pulling its weight"""
         if level == "l1":
             self.l1_hits += 1
         else:
@@ -39,32 +41,33 @@ class MetricsCollector:
         self.cache_hits += 1
     
     def record_cache_miss(self):
-        """Record cache miss"""
+        """Nothing in cache matched — we'll have to do the actual work this time"""
         self.cache_misses += 1
     
     def record_cache_write(self):
-        """Record cache write operation"""
+        """Called when we store a new response in the cache for future reuse"""
         self.cache_write_ops += 1
     
     def record_batch_write(self, count: int):
-        """Record batch write operation"""
+        """Same as above but for when multiple entries are written in one go"""
         self.batch_writes += count
     
     def record_error(self):
-        """Record error"""
+        """Something broke — bump the error counter so we can track how often this happens"""
         self.errors += 1
     
     def get_summary(self) -> dict:
-        """Get metrics summary"""
+        """Crunches all the numbers and returns a snapshot of how things are going right now"""
         total_requests = self.cache_hits + self.cache_misses
-        hit_rate = self.cache_hits / max(total_requests, 1)
+        hit_rate = self.cache_hits / max(total_requests, 1)  # max(..., 1) avoids dividing by zero on startup
         
-        # Calculate percentiles
+        # p95 and p99 latency tell you about worst-case performance —
+        # p95 means 95% of requests were faster than this number
         latencies_list = list(self.latencies)
         p95 = np.percentile(latencies_list, 95) if latencies_list else 0
         p99 = np.percentile(latencies_list, 99) if latencies_list else 0
         
-        # Calculate requests per second
+        # count requests from the last 60 seconds to get a per-second rate
         now = time.time()
         recent_requests = [t for t in self.request_timestamps if now - t <= 60]
         rps = len(recent_requests) / 60
@@ -86,7 +89,8 @@ class MetricsCollector:
         }
     
     def get_prometheus_metrics(self) -> dict:
-        """Format metrics for Prometheus"""
+        """Reshapes our summary into the format Prometheus expects —
+        Prometheus is a monitoring tool that scrapes this endpoint on a schedule"""
         summary = self.get_summary()
         
         return {
@@ -101,7 +105,8 @@ class MetricsCollector:
         }
     
     def reset(self):
-        """Reset all metrics"""
+        """Wipes everything back to zero — useful in tests or if you want a fresh start
+        without actually restarting the server"""
         self.latencies.clear()
         self.cache_hits = 0
         self.cache_misses = 0

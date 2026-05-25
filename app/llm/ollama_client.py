@@ -10,7 +10,12 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 class OllamaClient:
-    """Async client for local Ollama API with optimized connection pooling"""
+    """
+    Async HTTP client for the local Ollama API.
+    Handles connection pooling, retries, and batch generation.
+    Since Ollama runs locally, failures are usually real errors
+    rather than transient network issues — retry settings reflect that.
+    """
     
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -24,9 +29,13 @@ class OllamaClient:
         self._check_local_ollama()
         
     def _check_local_ollama(self):
-        """Check if local Ollama is accessible"""
+        """
+        Does a quick TCP socket check at startup to confirm Ollama is reachable.
+        This runs synchronously during __init__ so we get an early warning log
+        before any actual requests are made. Failures here are non-fatal —
+        we just log a warning and let the first real request surface the error.
+        """
         try:
-            # Extract host and port from URL
             url = self.base_url.replace('http://', '')
             host, port = url.split(':')
             
@@ -43,7 +52,12 @@ class OllamaClient:
             logger.warning(f"Could not check Ollama connectivity: {e}")
         
     async def _get_client(self) -> httpx.AsyncClient:
-        """Get or create HTTP client with optimized connection pooling for local"""
+        """
+        Lazily initializes the HTTP client and reuses it across calls.
+        HTTP/2 is on to multiplex concurrent requests over one connection —
+        makes a noticeable difference during batch generation.
+        keepalive_expiry=30 keeps the connection warm without holding it forever.
+        """
         if self.client is None or self.client.is_closed:
             self.client = httpx.AsyncClient(
                 base_url=self.base_url,
@@ -60,7 +74,9 @@ class OllamaClient:
     
     @retry(
         stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=0.5, min=0.5, max=5),  # Faster retries for local
+        wait=wait_exponential(multiplier=0.5, min=0.5, max=5),
+        # Only retry on timeout or connection errors — not on HTTP 4xx/5xx,
+        # since those indicate a real problem worth surfacing immediately.
         retry=retry_if_exception(lambda e: isinstance(e, (httpx.TimeoutException, httpx.ConnectError)))
     )
     async def generate(
@@ -70,11 +86,17 @@ class OllamaClient:
         max_tokens: int = 1000,
         stream: bool = False
     ) -> str:
-        """Generate response from local Ollama with optimized settings"""
+        """
+        Sends a prompt to Ollama and returns the generated text.
+
+        The options block controls the generation behaviour:
+        - num_ctx: context window size — 2048 is a reasonable default for most queries
+        - repeat_penalty: discourages the model from looping on the same phrase
+        - top_k / top_p: nucleus sampling params, standard values that work well generally
+        """
         client = await self._get_client()
         
         try:
-            # Optimized payload for local Ollama
             payload = {
                 "model": self.model,
                 "prompt": prompt,
@@ -82,7 +104,7 @@ class OllamaClient:
                 "max_tokens": max_tokens,
                 "stream": stream,
                 "options": {
-                    "num_ctx": 2048,  # Context window
+                    "num_ctx": 2048,
                     "num_predict": max_tokens,
                     "top_k": 40,
                     "top_p": 0.9,
@@ -118,9 +140,14 @@ class OllamaClient:
         self, 
         prompts: List[str],
         temperature: float = 0.7,
-        max_concurrent: int = 5  # Lower concurrency for local to avoid overloading
+        max_concurrent: int = 5  # kept low — local Ollama can't handle too many parallel requests
     ) -> List[str]:
-        """Generate responses for multiple prompts concurrently with semaphore"""
+        """
+        Runs multiple prompts concurrently, capped at max_concurrent to avoid
+        overloading the local model. Failed individual prompts don't abort the
+        whole batch — they're replaced with an error string so the caller
+        always gets a complete list back.
+        """
         semaphore = asyncio.Semaphore(max_concurrent)
         
         async def generate_with_semaphore(prompt: str) -> str:
@@ -130,7 +157,8 @@ class OllamaClient:
         tasks = [generate_with_semaphore(prompt) for prompt in prompts]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
         
-        # Handle errors
+        # return_exceptions=True means failures come back as Exception objects
+        # rather than crashing the gather — we swap them out for an error string here
         results = []
         for i, resp in enumerate(responses):
             if isinstance(resp, Exception):
@@ -142,7 +170,11 @@ class OllamaClient:
         return results
     
     async def check_model_availability(self) -> bool:
-        """Check if the model is available in local Ollama"""
+        """
+        Hits the Ollama /api/tags endpoint to confirm the configured model
+        is actually pulled and ready. Useful to call once at startup before
+        serving requests — saves confusing errors later if the model is missing.
+        """
         client = await self._get_client()
         try:
             response = await client.get("/api/tags")
@@ -158,7 +190,7 @@ class OllamaClient:
             return False
     
     async def close(self):
-        """Close HTTP client"""
+        """Closes the HTTP client. Call this on app shutdown to avoid connection leaks."""
         if self.client and not self.client.is_closed:
             await self.client.aclose()
             logger.debug("Ollama client closed")

@@ -15,7 +15,8 @@ from app.utils.metrics import MetricsCollector
 from app.utils.pool_manager import ConnectionPoolManager
 from app.llm.ollama_client import OllamaClient
 
-# Configure logging
+# setting up logs so we can see what's happening when the app runs
+# the format shows time, which part of the code logged it, and the message
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -26,13 +27,19 @@ settings = Settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage application lifecycle with optimized connection pooling"""
+    """
+    This runs when the server starts up and when it shuts down.
+    Think of it like the "opening and closing shift" of the app —
+    we set everything up before requests come in, and clean up after we're done.
+    """
     logger.info("Starting Semantic Caching Proxy with Local Ollama...")
     
-    # Verify local Ollama is accessible
+    # first, let's make sure Ollama is actually running on this machine
+    # no point starting if the AI model isn't even available
     test_client = OllamaClient(settings)
     model_available = await test_client.check_model_availability()
     if not model_available:
+        # warn the user and tell them exactly what command to run to fix it
         logger.warning(f"Model {settings.ollama_model} not available in local Ollama")
         logger.info(f"Please run: ollama pull {settings.ollama_model}")
         logger.info(f"and: ollama pull {settings.ollama_embedding_model}")
@@ -40,11 +47,13 @@ async def lifespan(app: FastAPI):
         logger.info(f"✓ Local Ollama model {settings.ollama_model} is available")
     await test_client.close()
     
-    # Initialize connection pools
+    # connection pools let us reuse existing connections instead of opening
+    # a new one every single request — much faster under load
     app.state.pool_manager = ConnectionPoolManager(settings)
     await app.state.pool_manager.initialize_all()
     
-    # Initialize Redis client
+    # connect to Redis — this is where we store cached responses
+    # Redis is basically a super fast in-memory key-value store
     redis_client = RedisVectorClient(
         settings.redis_url,
         settings.redis_vector_index,
@@ -54,7 +63,8 @@ async def lifespan(app: FastAPI):
     app.state.redis_client = redis_client
     logger.info("✓ Redis connected")
     
-    # Initialize rate limiter
+    # rate limiter makes sure one user can't spam the API and slow it down for everyone
+    # it's stored in Redis so it works across multiple server instances too
     rate_limiter = DistributedRateLimiter(
         redis_client.redis, 
         settings.rate_limit_per_minute,
@@ -62,11 +72,13 @@ async def lifespan(app: FastAPI):
     )
     app.state.rate_limiter = rate_limiter
     
-    # Initialize metrics collector
+    # metrics collector keeps track of things like cache hit rate, response times etc.
+    # useful for knowing if the cache is actually helping
     metrics = MetricsCollector()
     app.state.metrics = metrics
     
-    # Initialize semantic cache
+    # the semantic cache is the main feature here — instead of exact string matching,
+    # it finds responses to questions that *mean* the same thing even if worded differently
     semantic_cache = SemanticCache(
         redis_client, 
         settings,
@@ -74,7 +86,8 @@ async def lifespan(app: FastAPI):
     )
     app.state.semantic_cache = semantic_cache
     
-    # Warm up cache if enabled
+    # optionally pre-fill the cache with common queries so the first users
+    # don't have to wait for cold cache responses
     if settings.cache_warmup_enabled:
         await semantic_cache.warmup_cache()
     
@@ -82,24 +95,26 @@ async def lifespan(app: FastAPI):
     logger.info(f"✓ Local Ollama endpoint: {settings.ollama_base_url}")
     logger.info(f"✓ Model: {settings.ollama_model}")
     
-    yield
+    yield  # everything above runs on startup, everything below runs on shutdown
     
-    # Cleanup
+    # cleanup time — close all open connections properly
+    # skipping this can cause weird errors or resource leaks
     logger.info("Shutting down...")
     await app.state.pool_manager.close_all()
     await redis_client.close()
     logger.info("Shutdown complete")
 
-# Create FastAPI app
+# spinning up the actual FastAPI app with our lifespan handler attached
 app = FastAPI(
     title="Semantic Caching Proxy",
     description="High-performance semantic caching layer for local LLM APIs",
     version="1.0.0",
     lifespan=lifespan,
-    default_response_class=ORJSONResponse
+    default_response_class=ORJSONResponse  # faster JSON serialization than the default
 )
 
-# Add middleware
+# CORS lets browsers on other domains call our API
+# in production you'd want to lock down allowed_origins to specific domains
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins.split(","),
@@ -108,16 +123,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.add_middleware(RateLimitMiddleware)
-app.add_middleware(LoggingMiddleware)
+# these two run on every single request, in this order
+app.add_middleware(RateLimitMiddleware)   # block if they're sending too many requests
+app.add_middleware(LoggingMiddleware)     # log the request for debugging/monitoring
 
-# Include routers
+# attach our routes — all proxy routes will be under /api/...
 app.include_router(proxy_router, prefix="/api")
 
 @app.get("/health")
 async def health_check(request: Request):
-    """Health check endpoint with Ollama status"""
-    # Check Ollama status
+    """
+    Quick way to check if the server is alive and Ollama is reachable.
+    Load balancers and monitoring tools usually ping this endpoint.
+    """
+    # check if the Ollama model is still up — it might have gone down after startup
     ollama_client = OllamaClient(settings)
     model_available = await ollama_client.check_model_availability()
     await ollama_client.close()
@@ -135,20 +154,23 @@ async def health_check(request: Request):
 
 @app.get("/metrics")
 async def get_metrics(request: Request):
-    """Prometheus metrics endpoint"""
+    """Exposes stats in Prometheus format — plug this into Grafana for nice dashboards"""
     return request.app.state.metrics.get_prometheus_metrics()
 
 @app.get("/cache/stats")
 async def cache_stats(request: Request):
-    """Detailed cache statistics"""
+    """Breakdown of how the cache is doing — hit rate, size, evictions, that kind of thing"""
     return await request.app.state.semantic_cache.get_detailed_stats()
 
 @app.get("/ollama/status")
 async def ollama_status():
-    """Check Ollama status and available models"""
+    """
+    Checks what models are currently loaded in Ollama.
+    Handy for debugging when you're not sure if the right model got pulled.
+    """
     client = OllamaClient(settings)
     try:
-        # Check if Ollama is running
+        # hit Ollama's tags endpoint — it lists all downloaded models
         test_client = httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=5.0)
         response = await test_client.get("/api/tags")
         await test_client.aclose()
@@ -162,12 +184,14 @@ async def ollama_status():
                 "models": models,
                 "default_model": settings.ollama_model,
                 "embedding_model": settings.ollama_embedding_model,
+                # these two tell you if the models we actually need are present
                 "model_available": settings.ollama_model in models,
                 "embedding_available": settings.ollama_embedding_model in models
             }
         else:
             return {"status": "error", "message": f"HTTP {response.status_code}"}
     except Exception as e:
+        # if we can't even reach Ollama, surface the error message directly
         return {"status": "error", "message": str(e)}
     finally:
         await client.close()

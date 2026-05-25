@@ -2,17 +2,28 @@ from locust import HttpUser, task, between, events
 import random
 import time
 
-# Simple counters for metrics
+# Module-level counters shared across all user instances.
+# Not thread-safe in the strictest sense, but good enough for approximate
+# hit rate tracking during a load test — we don't need exact precision here.
 cache_hits = 0
 cache_misses = 0
 total_requests = 0
 
 class SemanticCacheUser(HttpUser):
-    """Simulates users testing the semantic cache proxy"""
+    """
+    Simulates realistic mixed traffic against the semantic cache proxy.
+    Uses a small pool of semantically related query pairs (e.g. "What is Python?"
+    and "Explain Python programming language") to exercise the semantic matching
+    logic — not just exact cache hits.
+
+    Task weights reflect typical traffic shape:
+        3x chat completions, 2x batch, 1x stats, 1x health
+    """
     
     wait_time = between(1, 3)
     
-    # Common queries for testing
+    # Query pairs are intentionally similar so the semantic cache gets a real workout.
+    # Each concept appears twice with different phrasing to test similarity matching.
     queries = [
         "What is Python?",
         "Explain Python programming language",
@@ -27,18 +38,20 @@ class SemanticCacheUser(HttpUser):
     ]
     
     def on_start(self):
-        """Called when user starts"""
         print(f"User started testing semantic cache")
     
     @task(3)
     def chat_completion(self):
-        """Test main chat endpoint"""
+        """
+        Core load test task — hits the main chat endpoint with a random query.
+        Tracks cache hits vs misses from the response payload and prints
+        a rolling hit rate every 20 requests so you can watch the cache warm up
+        in real time during the test.
+        """
         global cache_hits, cache_misses, total_requests
         
-        # Pick a random query
         query = random.choice(self.queries)
         
-        # Make the request
         with self.client.post(
             "/api/v1/chat/completions",
             json={
@@ -57,14 +70,12 @@ class SemanticCacheUser(HttpUser):
                 if data.get("cached"):
                     cache_hits += 1
                     response.success()
-                    # Add custom attribute for response time tracking
                     response.custom_data = {"cache_hit": True, "latency": data.get("latency_ms", 0)}
                 else:
                     cache_misses += 1
                     response.success()
                     response.custom_data = {"cache_hit": False, "latency": data.get("latency_ms", 0)}
                 
-                # Print occasional stats
                 if total_requests % 20 == 0:
                     hit_rate = (cache_hits / total_requests) * 100
                     print(f"Stats - Requests: {total_requests}, Cache Hits: {cache_hits}, Hit Rate: {hit_rate:.1f}%")
@@ -73,8 +84,11 @@ class SemanticCacheUser(HttpUser):
     
     @task(2)
     def batch_completions(self):
-        """Test batch endpoint"""
-        # Get 3 random queries
+        """
+        Tests the batch endpoint with 3 random queries per call.
+        Logs how many of the batch were served from cache — useful for
+        confirming the cache warms up correctly under mixed traffic.
+        """
         batch_queries = random.sample(self.queries, min(3, len(self.queries)))
         
         with self.client.post(
@@ -93,7 +107,11 @@ class SemanticCacheUser(HttpUser):
     
     @task(1)
     def cache_stats(self):
-        """Check cache statistics"""
+        """
+        Polls the cache stats endpoint periodically.
+        Low weight (1x) since this is just observability — we don't want
+        stats polling to dominate the request mix.
+        """
         with self.client.get(
             "/cache/stats",
             catch_response=True,
@@ -109,7 +127,7 @@ class SemanticCacheUser(HttpUser):
     
     @task(1)
     def health_check(self):
-        """Health check endpoint"""
+        """Confirms the service is up. Locust will flag this as a failure if it goes down mid-test."""
         with self.client.get(
             "/health",
             catch_response=True,
@@ -120,13 +138,18 @@ class SemanticCacheUser(HttpUser):
             else:
                 response.failure(f"Health check failed")
 
+
 class LoadTestUser(SemanticCacheUser):
-    """Heavy load testing with minimal wait time"""
+    """
+    Stress test variant — same queries as SemanticCacheUser but with minimal
+    wait time to simulate a traffic spike. Use this to find the breaking point
+    and see how the rate limiter and circuit breaker behave under pressure.
+    """
     wait_time = between(0, 0.5)
     
     @task
     def aggressive_test(self):
-        """High throughput testing"""
+        """High-throughput single-prompt requests with no think time between them."""
         query = random.choice(self.queries)
         
         with self.client.post(
@@ -140,14 +163,22 @@ class LoadTestUser(SemanticCacheUser):
             else:
                 response.failure("Failed")
 
+
 class CachePerformanceUser(HttpUser):
-    """Test cache performance with repeated queries"""
+    """
+    Focused cache performance test — sends the exact same query repeatedly
+    to measure how quickly the hit rate climbs to 100% after the first miss.
+    Run this in isolation (not mixed with other user classes) for a clean signal.
+    """
     wait_time = between(0.5, 1)
     
     @task
     def repeated_query(self):
-        """Send same query multiple times to test cache hit rate"""
-        # Use a fixed query that will definitely be cached after first call
+        """
+        Always sends the same prompt. After the first LLM call, every subsequent
+        request should be a cache hit — if it isn't, something is wrong with
+        the cache write path or the similarity threshold is too strict.
+        """
         query = "What is semantic caching?"
         
         with self.client.post(
@@ -161,13 +192,15 @@ class CachePerformanceUser(HttpUser):
                 if data.get("cached"):
                     response.success()
                 else:
-                    # First request might be miss, that's ok
+                    # First request will always be a miss — that's expected
                     response.success()
             else:
                 response.failure(f"Failed: {response.status_code}")
 
+
 @events.test_start.add_listener
 def on_test_start(environment, **kwargs):
+    """Prints a summary of what's being tested so the terminal output is easy to follow."""
     print("\n" + "="*60)
     print("🚀 SEMANTIC CACHE PROXY LOAD TEST STARTING")
     print("="*60)
@@ -178,8 +211,17 @@ def on_test_start(environment, **kwargs):
     print("  ✓ GET /health")
     print("="*60 + "\n")
 
+
 @events.test_stop.add_listener
 def on_test_stop(environment, **kwargs):
+    """
+    Prints a final hit rate summary when the test finishes.
+    The performance assessment thresholds are rough guidelines:
+        >80% — cache is working well for this query mix
+        >60% — decent, but the similarity threshold may be too strict
+        >40% — worth investigating Redis connectivity and threshold settings
+        <40% — something is likely misconfigured
+    """
     global cache_hits, cache_misses, total_requests
     
     print("\n" + "="*60)
@@ -197,7 +239,6 @@ def on_test_stop(environment, **kwargs):
         print(f"Cache Miss Rate:       {miss_rate:.1f}%")
         print(f"Cost Savings:          {hit_rate:.1f}% reduction in LLM calls")
         
-        # Performance assessment
         if hit_rate > 80:
             print("\n✅ EXCELLENT! Cache is working very well")
         elif hit_rate > 60:

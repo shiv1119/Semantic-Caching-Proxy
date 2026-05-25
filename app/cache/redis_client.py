@@ -22,7 +22,10 @@ class RedisVectorClient:
         self.dimension = settings.redis_vector_dimension
         
     async def connect(self):
-        """Establish connection pool with optimized settings"""
+        """
+        Establishes a connection pool with keepalive and retry support.
+        Also creates the vector index and starts the background write worker if write-behind is enabled.
+        """
         self.redis = await redis.from_url(
             self.redis_url,
             decode_responses=True,
@@ -33,22 +36,25 @@ class RedisVectorClient:
             retry_on_error=[redis.ConnectionError, redis.TimeoutError]
         )
         
-        # Test connection
         await self.redis.ping()
-        
-        # Create index
         await self._create_index()
         
-        # Start batch worker for async writes
+        # Write-behind mode batches cache writes asynchronously to avoid
+        # blocking the main request path on every cache store operation.
         if self.settings.cache_write_behind:
             self._batch_worker_task = asyncio.create_task(self._batch_write_worker())
         
         logger.info(f"Redis client connected to {self.redis_url}")
     
     async def _create_index(self):
-        """Create Redis vector similarity index with HNSW (safe for multi-worker startup)"""
+        """
+        Creates the HNSW vector index in Redis Stack.
+
+        We drop and recreate on startup to avoid stale index configs across deployments.
+        HNSW is used over flat search because it gives O(log n) lookup vs O(n),
+        which matters as the cache grows.
+        """
         try:
-            # Try to drop index if exists (ignore if doesn't exist)
             try:
                 await self.redis.execute_command(f"FT.DROPINDEX {self.index_name}")
                 logger.info(f"Dropped existing index {self.index_name}")
@@ -56,7 +62,6 @@ class RedisVectorClient:
                 if "Unknown index name" not in str(e):
                     logger.warning(f"Drop index warning: {e}")
 
-            # Create index with correct HNSW parameters
             create_command = (
                 f"FT.CREATE {self.index_name} "
                 f"ON HASH PREFIX 1 cache: "
@@ -86,7 +91,10 @@ class RedisVectorClient:
             raise
     
     async def store_batch(self, entries: List[Tuple[str, List[float], str, int, int]]):
-        """Store multiple entries in pipeline"""
+        """
+        Writes multiple cache entries in a single Redis pipeline.
+        Batching reduces round-trips significantly under concurrent load.
+        """
         if not entries:
             return
             
@@ -94,6 +102,7 @@ class RedisVectorClient:
         
         for query_hash, embedding, response, ttl, hit_count in entries:
             key = f"cache:{query_hash}"
+            # Redis vector search requires raw bytes in FLOAT32 format
             embedding_bytes = np.array(embedding, dtype=np.float32).tobytes()
             
             pipeline.hset(
@@ -112,13 +121,18 @@ class RedisVectorClient:
         await pipeline.execute()
     
     async def _batch_write_worker(self):
-        """Background worker for batch writes"""
+        """
+        Background task that drains the write queue in batches.
+
+        Flushes when the batch hits pipeline_batch_size OR after 100ms of inactivity —
+        whichever comes first. The timeout prevents entries from sitting in the queue
+        too long during low traffic periods.
+        """
         batch = []
         last_flush = time.time()
         
         while True:
             try:
-                # Wait for item with timeout
                 try:
                     item = await asyncio.wait_for(
                         self._batch_queue.get(), 
@@ -128,7 +142,6 @@ class RedisVectorClient:
                 except asyncio.TimeoutError:
                     pass
                 
-                # Flush if batch is full or timeout reached
                 if len(batch) >= self.pipeline_batch_size or \
                    (batch and time.time() - last_flush > 0.1):
                     await self.store_batch(batch)
@@ -147,7 +160,7 @@ class RedisVectorClient:
         ttl: int,
         hit_count: int = 0
     ):
-        """Store asynchronously using queue"""
+        """Enqueue a cache write — actual storage happens in the background worker."""
         await self._batch_queue.put((query_hash, embedding, response, ttl, hit_count))
     
     async def semantic_search(
@@ -156,12 +169,19 @@ class RedisVectorClient:
         threshold: float,
         k: int = 5
     ) -> List[Tuple[str, float]]:
-        """Search for semantically similar queries with optimized KNN"""
+        """
+        KNN vector search using Redis HNSW index.
+
+        Returns matches above the similarity threshold, sorted by best match first.
+        Redis returns cosine DISTANCE (0 = identical, 2 = opposite), so we convert
+        to similarity with: similarity = 1 - distance.
+
+        Threshold of 0.75 was chosen empirically — low enough to catch paraphrases,
+        high enough to avoid returning wrong cached answers.
+        """
         embedding_bytes = np.array(query_embedding, dtype=np.float32).tobytes()
         
         try:
-            # Correct syntax for Redis vector search
-            # Using FT.SEARCH with KNN predicate
             results = await self.redis.execute_command(
                 "FT.SEARCH",
                 self.index_name,
@@ -183,19 +203,15 @@ class RedisVectorClient:
             
             matches = []
             if results and len(results) > 0:
-                # First element is the number of results
                 num_results = results[0] if isinstance(results[0], int) else 0
                 
-                # Parse results
                 idx = 1
                 for _ in range(num_results):
                     if idx >= len(results):
                         break
                     
-                    # Document ID (skip)
-                    idx += 1
+                    idx += 1  # skip document ID
                     
-                    # Fields
                     if idx >= len(results):
                         break
                     
@@ -205,7 +221,6 @@ class RedisVectorClient:
                     response_text = ""
                     similarity = 0.0
                     
-                    # Parse fields (they come as pairs)
                     if isinstance(fields, list):
                         for j in range(0, len(fields), 2):
                             if j + 1 < len(fields):
@@ -216,13 +231,11 @@ class RedisVectorClient:
                                     response_text = field_value
                                 elif field_name == "vector_score":
                                     try:
-                                        # Convert distance to similarity
                                         distance = float(field_value)
-                                        similarity = 1 - distance
+                                        similarity = 1 - distance  # convert distance → similarity
                                     except:
                                         pass
                     
-                    # Only include if similarity meets threshold and we have a response
                     if similarity >= threshold and response_text:
                         matches.append((response_text, similarity))
             
@@ -238,7 +251,10 @@ class RedisVectorClient:
             return []
     
     async def get_by_exact_match(self, query_hash: str) -> Optional[str]:
-        """Get exact match by hash (fallback for exact matches)"""
+        """
+        Tier-1 cache lookup by exact query hash before falling back to vector search.
+        Faster and cheaper than HNSW for identical repeated queries.
+        """
         try:
             key = f"cache:{query_hash}"
             response = await self.redis.hget(key, "response")
@@ -248,7 +264,7 @@ class RedisVectorClient:
             return None
     
     async def increment_hit_count(self, query_hash: str):
-        """Atomically increment hit count for popularity tracking"""
+        """Tracks how often a cached entry is served — useful for cache analytics and eviction tuning."""
         try:
             key = f"cache:{query_hash}"
             await self.redis.hincrby(key, "hit_count", 1)
@@ -257,10 +273,9 @@ class RedisVectorClient:
             logger.error(f"Failed to increment hit count: {e}")
     
     async def get_size(self) -> int:
-        """Get total number of cached entries"""
+        """Returns the number of documents currently indexed in the vector store."""
         try:
             info = await self.redis.execute_command(f"FT.INFO {self.index_name}")
-            # Parse INFO response
             for i, val in enumerate(info):
                 if val == "num_docs":
                     return int(info[i + 1])
@@ -269,7 +284,7 @@ class RedisVectorClient:
         return 0
     
     async def get_cache_stats(self) -> Dict:
-        """Get detailed cache statistics"""
+        """Returns raw FT.INFO stats — used by the /metrics endpoint."""
         try:
             info = await self.redis.execute_command(f"FT.INFO {self.index_name}")
             stats = {}
@@ -283,9 +298,8 @@ class RedisVectorClient:
             return {}
     
     async def clear_all(self):
-        """Clear all cache entries (for testing)"""
+        """Wipes all cache entries. Intended for testing — not safe to call in production."""
         try:
-            # Get all keys with prefix
             keys = await self.redis.keys("cache:*")
             if keys:
                 await self.redis.delete(*keys)
@@ -294,13 +308,15 @@ class RedisVectorClient:
             logger.error(f"Failed to clear cache: {e}")
     
     async def cleanup_expired(self):
-        """Clean up expired entries"""
-        # Redis handles TTL automatically, but we can log stats
+        """
+        Redis handles TTL expiry automatically, so no manual cleanup is needed.
+        This exists as a hook for logging cache size over time.
+        """
         size = await self.get_size()
         logger.debug(f"Current cache size: {size} entries")
     
     async def close(self):
-        """Close connections"""
+        """Gracefully shuts down the batch worker and closes the Redis connection."""
         if self._batch_worker_task:
             self._batch_worker_task.cancel()
             try:

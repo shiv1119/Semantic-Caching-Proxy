@@ -39,12 +39,10 @@ services:
       - cache-network
     restart: unless-stopped
 
-  # Production cluster deployment - FIXED (removed container_name)
   semantic-proxy-cluster:
     build: .
-    # No container_name here - Docker will generate names like semantic-proxy-cluster-1, semantic-proxy-cluster-2
     ports:
-      - "8002-8003:8000"  # Map ports 8002 and 8003 to the two replicas
+      - "8002-8003:8000"  
     environment:
       - REDIS_URL=redis://redis-stack:6379
       - OLLAMA_BASE_URL=http://host.docker.internal:11434
@@ -67,7 +65,6 @@ services:
         condition: on-failure
     networks:
       - cache-network
-    # Remove restart: unless-stopped when using deploy (deploy handles restart)
 
   prometheus:
     image: prom/prometheus:latest
